@@ -23,6 +23,7 @@ Usage:
 
 import sys
 import argparse
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -66,6 +67,46 @@ ROUTE_CONF = 0.35
 CROP_PADDING = 0.2   # bbox 四周扩展比例
 CROP_RESIZE = 256    # 裁剪后 resize 尺寸
 
+class DrowningTracker:
+    def __init__(self, window_size=60, alarm_ratio=0.6, stale_frame_threshold=60):
+        self.window_size = window_size
+        self.alarm_ratio = alarm_ratio
+        self.stale_frame_threshold = stale_frame_threshold
+        self.history = {}  # {track_id: {"history": deque, "last_seen": frame_index}}
+
+    def update(self, track_id, is_drowning, frame_index=None):
+        if track_id not in self.history:
+            self.history[track_id] = {
+                "history": deque(maxlen=self.window_size),
+                "last_seen": frame_index if frame_index is not None else 0,
+            }
+
+        self.history[track_id]["history"].append(1 if is_drowning else 0)
+
+        if frame_index is not None:
+            self.history[track_id]["last_seen"] = frame_index
+
+        drowning_count = sum(self.history[track_id]["history"])
+        current_ratio = drowning_count / len(self.history[track_id]["history"])
+
+        if current_ratio >= self.alarm_ratio:
+            return "drowning"
+        elif drowning_count > 0:
+            return "drowning_possible"
+        return "swimming"
+
+    def cleanup(self, active_ids, current_frame_index):
+        if active_ids is None or current_frame_index is None:
+            return
+
+        keys_to_delete = [
+            tid for tid, data in self.history.items()
+            if tid not in active_ids and
+            (current_frame_index - data["last_seen"]) >= self.stale_frame_threshold
+        ]
+
+        for tid in keys_to_delete:
+            del self.history[tid]
 
 # ===========================================================================
 #  裁剪函数
@@ -117,6 +158,8 @@ def crop_person_in_water(image, box_xyxy, padding=CROP_PADDING):
 # ===========================================================================
 
 def two_stage_inference(image, stage1_model, stage2_model=None,
+                        tracker=None,
+                        frame_index=None,
                         drowning_threshold=DROWNING_THRESHOLD,
                         route_conf=ROUTE_CONF,
                         drowning_confirm=DROWNING_CONFIRM,
@@ -155,6 +198,12 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
         xyxy = box.xyxy[0].cpu().numpy()
+        track_id = None
+        if getattr(box, 'id', None) is not None:
+            try:
+                track_id = int(box.id[0])
+            except Exception:
+                track_id = None
 
         coarse_class = STAGE1_CLASS_NAMES[cls_id]
 
@@ -172,6 +221,7 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
                     "fine_conf": conf,
                     "drowning_conf": None,
                     "swimming_conf": None,
+                    "track_id": track_id,
                 })
                 continue
 
@@ -188,6 +238,7 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
                     "fine_conf": conf,
                     "drowning_conf": None,
                     "swimming_conf": None,
+                    "track_id": track_id,
                 })
                 continue
 
@@ -202,7 +253,7 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
                 drowning_conf = float(probs.data[0])  # drowning = class 0
                 swimming_conf = float(probs.data[1])   # swimming = class 1
 
-                # [阈值缓解] 分级 + 拒识判定:
+                # [阈值缓解] 分级 + 拒识别判定:
                 # Stage2 是强迫二选一 (drowning/swimming), 杂物 crop 常被随机判成
                 # 其中一类 → 误报红框。引入 "不确定" 档: 当两类最大概率都
                 # 很低 (max < min_class_conf) 时, 视为存疑/非人, 不触发任何告警。
@@ -212,18 +263,40 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
                     # 不确定 / 存疑: 杂物大概率落此区间, 中性框, 不告警
                     fine_class = "person_in_water(未分类)"
                     fine_conf = max_conf
-                elif drowning_conf > swimming_conf and drowning_conf >= drowning_confirm:
-                    # 确认溺水: 红框 (高置信且压倒 swimming)
-                    fine_class = "drowning"
-                    fine_conf = drowning_conf
-                elif drowning_conf >= drowning_threshold:
-                    # 疑似溺水: 橙框
-                    fine_class = "drowning_possible"
-                    fine_conf = swimming_conf  # swimming更高, 但drowning仍值得关注
                 else:
-                    # 游泳 / 正常: 绿框
-                    fine_class = "swimming"
-                    fine_conf = swimming_conf
+                    is_drowning_now = (
+                        drowning_conf > swimming_conf and
+                        drowning_conf >= drowning_confirm
+                    )
+
+                    if tracker is not None and getattr(box, 'id', None) is not None:
+                        try:
+                            track_id = int(box.id[0])
+                        except Exception:
+                            track_id = None
+
+                        if track_id is not None:
+                            fine_class = tracker.update(
+                                track_id,
+                                is_drowning_now,
+                                frame_index=frame_index,
+                            )
+                        else:
+                            if is_drowning_now:
+                                fine_class = "drowning"
+                            elif drowning_conf >= drowning_threshold:
+                                fine_class = "drowning_possible"
+                            else:
+                                fine_class = "swimming"
+                    else:
+                        if is_drowning_now:
+                            fine_class = "drowning"
+                        elif drowning_conf >= drowning_threshold:
+                            fine_class = "drowning_possible"
+                        else:
+                            fine_class = "swimming"
+
+                    fine_conf = drowning_conf if fine_class == "drowning" else swimming_conf
 
                 output.append({
                     "bbox": xyxy.tolist(),
@@ -233,6 +306,7 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
                     "fine_conf": fine_conf,
                     "drowning_conf": drowning_conf,
                     "swimming_conf": swimming_conf,
+                    "track_id": track_id,
                 })
             else:
                 # 裁剪失败, 只保留粗类
@@ -244,6 +318,7 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
                     "fine_conf": None,
                     "drowning_conf": None,
                     "swimming_conf": None,
+                    "track_id": track_id,
                 })
         else:
             # 非 person_in_water, 只保留粗类
@@ -255,6 +330,7 @@ def two_stage_inference(image, stage1_model, stage2_model=None,
                 "fine_conf": None,
                 "drowning_conf": None,
                 "swimming_conf": None,
+                "track_id": track_id,
             })
 
     return output
@@ -371,6 +447,9 @@ def main():
     print(f"[推理] 加载 Stage 2 模型: {args.stage2_weights}")
     stage2 = YOLO(args.stage2_weights)
 
+    tracker = DrowningTracker(window_size=30, alarm_ratio=0.6,
+                              stale_frame_threshold=60)
+
     # 推理
     source = args.source
 
@@ -378,17 +457,24 @@ def main():
     if source.isdigit():
         # 摄像头
         cap = cv2.VideoCapture(int(source))
+        frame_index = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
             results = two_stage_inference(frame, stage1, stage2,
+                                          tracker=tracker,
+                                          frame_index=frame_index,
                                           drowning_threshold=cli_drowning_threshold,
                                           route_conf=cli_route_conf,
                                           drowning_confirm=cli_drowning_confirm,
                                           min_class_conf=cli_min_class_conf)
             img_out = draw_results(frame, results)
+
+            active_ids = {r["track_id"] for r in results if r.get("track_id") is not None}
+            tracker.cleanup(active_ids, frame_index)
+            frame_index += 1
 
             if args.show:
                 cv2.imshow("Two-Stage Inference", img_out)
@@ -477,17 +563,24 @@ def main():
                 writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"),
                                          fps, (w, h))
 
+            frame_index = 0
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
                 results = two_stage_inference(frame, stage1, stage2,
+                                              tracker=tracker,
+                                              frame_index=frame_index,
                                               drowning_threshold=cli_drowning_threshold,
                                           route_conf=cli_route_conf,
                                           drowning_confirm=cli_drowning_confirm,
                                           min_class_conf=cli_min_class_conf)
                 img_out = draw_results(frame, results)
+
+                active_ids = {r["track_id"] for r in results if r.get("track_id") is not None}
+                tracker.cleanup(active_ids, frame_index)
+                frame_index += 1
 
                 if writer:
                     writer.write(img_out)

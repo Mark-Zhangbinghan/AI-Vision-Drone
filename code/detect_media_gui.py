@@ -44,7 +44,7 @@ _spec_std.loader.exec_module(_pipeline_std)
 
 # 时序增强版 (含 DrowningTracker)
 _spec_tmp = importlib.util.spec_from_file_location(
-    "pipeline_temporal", str(PROJECT_ROOT / "pipeline_infrence" / "pipeline_inference.py"))
+    "pipeline_temporal", str(PROJECT_ROOT / "pipeline_inference.py"))
 _pipeline_temporal = importlib.util.module_from_spec(_spec_tmp)
 _spec_tmp.loader.exec_module(_pipeline_temporal)
 
@@ -627,7 +627,7 @@ class MediaDetectGUI:
                                        bg=bg, fg=FG_LIGHT, font=("Consolas", 9),
                                        selectcolor=BG_DARK, activebackground=bg, activeforeground="#FFF")
         mode_standard.pack(anchor=tk.W, padx=12, pady=1)
-        mode_temporal = tk.Radiobutton(mode_group, text="时序模式 (30帧投票, 抑制误报)",
+        mode_temporal = tk.Radiobutton(mode_group, text="时序模式 (60帧投票, 抑制误报)",
                                        variable=self.mode_var, value="temporal",
                                        command=self._on_mode_change,
                                        bg=bg, fg=FG_LIGHT, font=("Consolas", 9),
@@ -793,7 +793,7 @@ class MediaDetectGUI:
         """Get or lazily create DrowningTracker for temporal mode."""
         if self._tracker is None:
             self._tracker = _pipeline_temporal.DrowningTracker(
-                window_size=30, alarm_ratio=0.6, stale_frame_threshold=60)
+                window_size=60, alarm_ratio=0.6, stale_frame_threshold=60)
         return self._tracker
 
     def _detect_frame(self, frame):
