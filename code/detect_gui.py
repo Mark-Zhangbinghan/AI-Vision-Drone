@@ -58,9 +58,7 @@ from pipeline_inference import (
 # Combined display categories (for stats panel)
 DISPLAY_CLASSES = [
     "person",
-    "person_in_water",
     "drowning",
-    "drowning_possible",
     "swimming",
     "boat",
     "floating_object",
@@ -70,11 +68,8 @@ DISPLAY_CLASSES = [
 # Color map for display (BGR for OpenCV)
 DISPLAY_BGR = {
     "drowning":                (0, 0, 255),       # Red - confirmed drowning
-    "drowning_possible":       (0, 165, 255),     # Orange - warning level
-    "swimming":                (0, 200, 0),       # Green
-    "person_in_water(未分类)":  (255, 165, 0),     # Orange
+    "swimming":                (0, 200, 0),       # Green (含未分类降级)
     "person":                  (255, 0, 0),       # Blue
-    "person_in_water":         (0, 200, 0),       # Green (fallback)
     "boat":                    (0, 255, 255),     # Yellow
     "floating_object":         (128, 128, 128),   # Gray
     "life_buoy":               (0, 165, 255),     # Orange
@@ -86,7 +81,6 @@ DEFAULT_STAGE2 = PROJECT_ROOT / "runs" / "stage2_v1" / "best.pt"
 
 # Thresholds
 DEFAULT_CONF = 0.5
-DEFAULT_DROWNING_THRESHOLD = 0.5
 
 # Window
 WINDOW_TITLE = "Two-Stage Drowning Detection - Live Camera"
@@ -131,7 +125,7 @@ class DetectGUI:
 
     def __init__(self, stage1_path=None, stage2_path=None,
                  camera_id=0, source=None,
-                 conf=DEFAULT_CONF, drowning_threshold=DEFAULT_DROWNING_THRESHOLD):
+                 conf=DEFAULT_CONF):
         # ---- Models ----
         self.stage1_path = stage1_path
         self.stage2_path = stage2_path
@@ -153,10 +147,8 @@ class DetectGUI:
 
         # ---- Detection settings ----
         self.conf_threshold = conf
-        self.drowning_threshold = drowning_threshold
         self.last_results = None
         self.drowning_detected = False
-        self.drowning_possible_detected = False
         self._alert_flash = False
 
         # ---- Statistics ----
@@ -342,22 +334,6 @@ class DetectGUI:
                                          bg=bg, fg="#ffff00", font=("Consolas", 11, "bold"))
         self.conf_value_label.pack()
 
-        # ---- Drowning Warning Threshold ----
-        drown_group = tk.LabelFrame(self.control_frame, text="Drowning Warning Threshold",
-                                    bg=bg, fg="#FFA500", font=("Consolas", 10, "bold"))
-        drown_group.pack(fill=tk.X, **pad)
-
-        self.drown_var = tk.DoubleVar(value=DEFAULT_DROWNING_THRESHOLD)
-        self.drown_slider = tk.Scale(drown_group, from_=0.1, to=0.9, resolution=0.05,
-                                     orient=tk.HORIZONTAL, variable=self.drown_var,
-                                     bg=bg, fg=fg, troughcolor="#444", highlightthickness=0,
-                                     command=self._on_drown_change)
-        self.drown_slider.pack(fill=tk.X, **pad)
-
-        self.drown_value_label = tk.Label(drown_group, text=f"{DEFAULT_DROWNING_THRESHOLD:.2f}",
-                                          bg=bg, fg="#F09595", font=("Consolas", 11, "bold"))
-        self.drown_value_label.pack()
-
         ttk.Separator(self.control_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, **pad)
 
         # ---- Camera Controls ----
@@ -401,8 +377,6 @@ class DetectGUI:
             color_fg = "#cccccc"
             if name == "drowning":
                 color_fg = "#F09595"
-            elif name == "drowning_possible":
-                color_fg = "#FFA500"
             elif name == "swimming":
                 color_fg = "#5DCAA5"
             lbl = tk.Label(stats_group, text=f"{name:>14}: 0",
@@ -424,10 +398,6 @@ class DetectGUI:
         self.conf_value_label.config(text=f"{self.conf_threshold:.2f}")
         if self.stage1_model:
             self.stage1_model.conf = self.conf_threshold
-
-    def _on_drown_change(self, val):
-        self.drowning_threshold = float(val)
-        self.drown_value_label.config(text=f"{self.drowning_threshold:.2f}")
 
     def _browse_stage1(self):
         from tkinter import filedialog
@@ -569,8 +539,7 @@ class DetectGUI:
         self.stage1_model.conf = self.conf_threshold
 
         # Use the pipeline inference function (with drowning_threshold param)
-        results = two_stage_inference(frame, self.stage1_model, self.stage2_model,
-                                       drowning_threshold=self.drowning_threshold)
+        results = two_stage_inference(frame, self.stage1_model, self.stage2_model)
 
         total_time = (time.time() - t0) * 1000  # ms
 
@@ -590,12 +559,9 @@ class DetectGUI:
         # Use the shared draw_results function
         frame_out = draw_results(frame, results)
 
-        # Check for drowning detection (graded)
+        # Check for drowning detection
         self.drowning_detected = any(
             r.get("fine_class") == "drowning" for r in results
-        )
-        self.drowning_possible_detected = any(
-            r.get("fine_class") == "drowning_possible" for r in results
         )
 
         return frame_out
@@ -629,21 +595,16 @@ class DetectGUI:
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
 
         # Thresholds display
-        cv2.putText(frame, f"conf={self.conf_threshold:.2f} warn>{self.drowning_threshold:.2f}",
-                    (w - 200, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        cv2.putText(frame, f"conf={self.conf_threshold:.2f}",
+                    (w - 160, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
-        # Drowning alert: graded display
+        # Drowning alert
         if self.drowning_detected:
             self._alert_flash = not self._alert_flash
             if self._alert_flash:
                 cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 6)
                 cv2.putText(frame, "DROWNING ALERT!", (w // 2 - 130, h - 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-        elif self.drowning_possible_detected:
-            # Possible drowning: orange border (steady, no flash)
-            cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 165, 255), 3)
-            cv2.putText(frame, "POSSIBLE DROWNING", (w // 2 - 130, h - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
 
         return frame
 
@@ -712,8 +673,6 @@ class DetectGUI:
             coarse = r.get("coarse_class")
             if fine and fine in self.class_counts:
                 self.class_counts[fine] += 1
-            elif coarse == "person_in_water" and fine and fine not in ("drowning", "swimming"):
-                self.class_counts["person_in_water"] += 1
             elif coarse in self.class_counts:
                 self.class_counts[coarse] += 1
 
@@ -767,11 +726,9 @@ class DetectGUI:
             lbl.config(text=f"{name:>14}: {count}")
 
     def _update_alert(self):
-        """Update drowning alert indicator (graded)."""
+        """Update drowning alert indicator."""
         if self.drowning_detected:
             self.alert_label.config(text="!! DROWNING DETECTED !!", fg="#E24B4A")
-        elif self.drowning_possible_detected:
-            self.alert_label.config(text="POSSIBLE DROWNING", fg="#FFA500")
         else:
             self.alert_label.config(text="", fg="#E24B4A")
 
@@ -829,8 +786,6 @@ def main():
                         help="Video file path instead of camera")
     parser.add_argument("--conf", type=float, default=DEFAULT_CONF,
                         help="Stage 1 confidence threshold")
-    parser.add_argument("--drowning-threshold", type=float, default=DEFAULT_DROWNING_THRESHOLD,
-                        help="Drowning safety threshold (lower = more alerts)")
     args = parser.parse_args()
 
     # Auto-find models if defaults don't exist
@@ -850,7 +805,6 @@ def main():
         camera_id=args.camera,
         source=args.source,
         conf=args.conf,
-        drowning_threshold=args.drowning_threshold,
     )
     app.run()
 
