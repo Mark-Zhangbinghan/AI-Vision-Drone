@@ -164,7 +164,7 @@ def main():
                 threading.Thread(target=handle_drone_emergency, args=(drone,), daemon=True).start()
             elif not final_alarm:
                 # 如果警报解除，重置锁以便下次可以再次触发（视具体业务需求而定）
-                alarm_triggered_lock = False
+                alarm_triggered_lock = True
 
             # Draw global alarm text on screen
             if final_alarm:
@@ -212,6 +212,7 @@ def main():
             if key == ord('q'):
                 break
             if key == ord('m'):
+                alarm_triggered_lock = False
                 use_microphone = not use_microphone
                 state = "ENABLED" if use_microphone else "DISABLED"
                 print(f"[INFO] Microphone fusion mode switched to {state}")
