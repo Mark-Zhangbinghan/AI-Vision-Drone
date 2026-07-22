@@ -69,11 +69,11 @@ def drone_keepalive(drone):
     while drone_keepalive_running:
         try:
             # 新版djitellopy支持
-            drone.send_keepalive()
+            # drone.send_keepalive()
 
             # 如果你的版本没有send_keepalive()
             # 可以改成：
-            # drone.get_battery()
+            drone.get_battery()
 
         except Exception as e:
             print(f"[WARNING] KeepAlive failed: {e}")
@@ -266,13 +266,15 @@ def main():
                 break
             if key == ord('m'):
                 use_microphone = not use_microphone
-                mission_executed = False
                 state = "ENABLED" if use_microphone else "DISABLED"
                 print(f"[INFO] Microphone fusion mode switched to {state}")
                 print("[INFO] Drone mission state reset.")
 
                 if use_microphone:
                     start_hydrophone()
+            if key == ord('r'):
+                mission_executed = False
+
 
     finally:
         # Release all resources safely before exit
