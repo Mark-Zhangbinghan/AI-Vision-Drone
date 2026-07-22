@@ -20,6 +20,13 @@ hydrophone_running = False
 mic_drowning = False
 
 # ==============================
+# Drone Control Flags
+# ==============================
+drone_keepalive_running = False
+mission_executed = False
+drone_busy = False
+
+# ==============================
 # Model Path Configuration
 # ==============================
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -52,22 +59,54 @@ def start_hydrophone():
     print("[INFO] Hydrophone detection thread started")
 
 
-def handle_drone_emergency(drone):
-    """当检测到溺水警报时，控制无人机起飞执行救援/悬停，随后降落。"""
-    print("[WARNING] Drowning alarm triggered! Controlling Tello drone...")
-    try:
-        # 1. 自动起飞
-        drone.takeoff()
-        print("[INFO] Drone took off. Holding position for inspection...")
+def drone_keepalive(drone):
+    """
+    Periodically send keepalive commands to prevent
+    the Tello SDK connection from timing out.
+    """
+    global drone_keepalive_running
 
-        # 2. 悬停观察几秒钟（可根据需要调整等待时间）
+    while drone_keepalive_running:
+        try:
+            # 新版djitellopy支持
+            drone.send_keepalive()
+
+            # 如果你的版本没有send_keepalive()
+            # 可以改成：
+            # drone.get_battery()
+
+        except Exception as e:
+            print(f"[WARNING] KeepAlive failed: {e}")
+
         time.sleep(5)
 
-        # 3. 任务结束，自动降落
-        print("[INFO] Mission complete. Landing drone...")
+
+def handle_drone_emergency(drone):
+    """
+    Execute rescue mission only once.
+    """
+    global drone_busy
+
+    drone_busy = True
+
+    print("[WARNING] Drowning alarm triggered!")
+
+    try:
+        drone.takeoff()
+        print("[INFO] Takeoff complete")
+        time.sleep(2)
+        print("[INFO] Performing flip...")
+        drone.flip_forward()
+        time.sleep(2)
+        print("[INFO] Landing...")
         drone.land()
+        print("[INFO] Mission completed.")
+
     except Exception as e:
-        print(f"[ERROR] Drone operation failed: {e}")
+        print(f"[ERROR] Drone mission failed: {e}")
+
+    finally:
+        drone_busy = False
 
 
 def main():
@@ -77,6 +116,14 @@ def main():
     drone = djitellopy.Tello()
     try:
         drone.connect()
+        global drone_keepalive_running
+        drone_keepalive_running = True
+        threading.Thread(
+            target=drone_keepalive,
+            args=(drone,),
+            daemon=True
+        ).start()
+        print("[INFO] Drone KeepAlive thread started")
         print(f"[INFO] Tello connected successfully. Battery: {drone.get_battery()}%")
     except Exception as e:
         print(f"[ERROR] Failed to connect to Tello: {e}")
@@ -107,7 +154,8 @@ def main():
     print("[INFO] Press 'q' to exit program")
     print("[INFO] Press 'm' to toggle microphone fusion mode")
 
-    alarm_triggered_lock = False  # 防止连续重复触发起飞
+    global mission_executed
+    mission_executed = False
     frame_id = 0
 
     try:
@@ -158,13 +206,18 @@ def main():
                 final_alarm = vision_alarm_active
 
             # --- 无人机联动控制核心逻辑 ---
-            if final_alarm and not alarm_triggered_lock:
-                alarm_triggered_lock = True
-                # 使用独立线程调用无人机，避免阻塞主视频帧的实时读取与渲染
-                threading.Thread(target=handle_drone_emergency, args=(drone,), daemon=True).start()
-            elif not final_alarm:
-                # 如果警报解除，重置锁以便下次可以再次触发（视具体业务需求而定）
-                alarm_triggered_lock = True
+            if (
+                    final_alarm
+                    and not mission_executed
+                    and not drone_busy
+            ):
+                mission_executed = True
+
+                threading.Thread(
+                    target=handle_drone_emergency,
+                    args=(drone,),
+                    daemon=True
+                ).start()
 
             # Draw global alarm text on screen
             if final_alarm:
@@ -212,15 +265,18 @@ def main():
             if key == ord('q'):
                 break
             if key == ord('m'):
-                alarm_triggered_lock = False
                 use_microphone = not use_microphone
+                mission_executed = False
                 state = "ENABLED" if use_microphone else "DISABLED"
                 print(f"[INFO] Microphone fusion mode switched to {state}")
+                print("[INFO] Drone mission state reset.")
+
                 if use_microphone:
                     start_hydrophone()
 
     finally:
         # Release all resources safely before exit
+        drone_keepalive_running = False
         print("[INFO] Releasing resources and landing drone if needed...")
         try:
             drone.end()
