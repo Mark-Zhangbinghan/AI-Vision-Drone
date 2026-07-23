@@ -5,7 +5,9 @@ from pathlib import Path
 from ultralytics import YOLO
 import djitellopy
 
-import hydrophone_testing
+import importlib
+acoustic_drowning = importlib.import_module("Acousting Drowning Detection With Microphone")
+
 from pipeline_inference import (
     two_stage_inference,
     draw_results,
@@ -23,8 +25,8 @@ mic_drowning = False
 # Drone Control Flags
 # ==============================
 drone_keepalive_running = False
-mission_executed = False
 drone_busy = False
+drone_armed = True  # set to False after dispatch; press 'r' to re-arm
 
 # ==============================
 # Model Path Configuration
@@ -51,7 +53,7 @@ def start_hydrophone():
         print("[INFO] Hydrophone thread already running, skip launch")
         return
     thread = threading.Thread(
-        target=hydrophone_testing.main,
+        target=acoustic_drowning.main,
         daemon=True
     )
     thread.start()
@@ -83,9 +85,10 @@ def drone_keepalive(drone):
 
 def handle_drone_emergency(drone):
     """
-    Execute rescue mission only once.
+    Execute rescue mission: takeoff → climb 1.7m → flip → land.
+    Disarms drone after completion; press 'r' to re-arm for next action.
     """
-    global drone_busy
+    global drone_busy, drone_armed
 
     drone_busy = True
 
@@ -93,12 +96,14 @@ def handle_drone_emergency(drone):
 
     try:
         drone.takeoff()
-        print("[INFO] Takeoff complete")
-        time.sleep(2)
-        print("[INFO] Performing flip...")
+        print("[INFO] Takeoff complete — climbing to 1.7m...")
+        time.sleep(1)
+        drone.move_up(170)  # climb 1.7m
+        print("[INFO] Reached 1.7m — performing flip...")
+        time.sleep(1)
         drone.flip_forward()
+        print("[INFO] Flip complete — landing...")
         time.sleep(2)
-        print("[INFO] Landing...")
         drone.land()
         print("[INFO] Mission completed.")
 
@@ -107,10 +112,12 @@ def handle_drone_emergency(drone):
 
     finally:
         drone_busy = False
+        drone_armed = False
+        print("[INFO] Drone disarmed — press 'r' to re-arm for next rescue")
 
 
 def main():
-    global use_microphone, mic_drowning, hydrophone_running
+    global use_microphone, mic_drowning, hydrophone_running, drone_armed
 
     print("[INFO] Initializing Tello Drone...")
     drone = djitellopy.Tello()
@@ -137,7 +144,7 @@ def main():
 
     # ByteTrack Sliding Window Tracker Init
     tracker = DrowningTracker(
-        window_size=90,
+        window_size=120,
         alarm_ratio=0.6,
         stale_frame_threshold=60
     )
@@ -151,11 +158,11 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     print("[INFO] Camera stream started")
+    cv2.namedWindow("Drowning Detection Camera - Drone Linkage", cv2.WINDOW_NORMAL)
     print("[INFO] Press 'q' to exit program")
     print("[INFO] Press 'm' to toggle microphone fusion mode")
+    print("[INFO] Press 'r' to re-arm drone for next rescue action")
 
-    global mission_executed
-    mission_executed = False
     frame_id = 0
 
     try:
@@ -167,7 +174,7 @@ def main():
 
             # Sync hydrophone drowning signal ONLY when mic fusion is enabled
             if use_microphone and hydrophone_running:
-                mic_drowning = hydrophone_testing.drowning
+                mic_drowning = acoustic_drowning.drowning
             else:
                 mic_drowning = False
 
@@ -206,13 +213,8 @@ def main():
                 final_alarm = vision_alarm_active
 
             # --- 无人机联动控制核心逻辑 ---
-            if (
-                    final_alarm
-                    and not mission_executed
-                    and not drone_busy
-            ):
-                mission_executed = True
-
+            # Dispatch once per arming — must press 'r' to re-arm after each action
+            if final_alarm and not drone_busy and drone_armed:
                 threading.Thread(
                     target=handle_drone_emergency,
                     args=(drone,),
@@ -223,7 +225,7 @@ def main():
             if final_alarm:
                 cv2.putText(
                     output,
-                    "!!! DROWNING ALERT - DRONE DISPATCHED !!!",
+                    "!!! DROWNING ALERT — DRONE DISPATCHING !!!",
                     (30, 60),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1.0,
@@ -255,7 +257,11 @@ def main():
                 2
             )
 
-            # Render video window
+            # Render video window — scale to current window size
+            win_w = cv2.getWindowImageRect("Drowning Detection Camera - Drone Linkage")[2]
+            win_h = cv2.getWindowImageRect("Drowning Detection Camera - Drone Linkage")[3]
+            if win_w > 0 and win_h > 0:
+                output = cv2.resize(output, (win_w, win_h))
             cv2.imshow("Drowning Detection Camera - Drone Linkage", output)
 
             frame_id += 1
@@ -266,25 +272,40 @@ def main():
                 break
             if key == ord('m'):
                 use_microphone = not use_microphone
-                state = "ENABLED" if use_microphone else "DISABLED"
-                print(f"[INFO] Microphone fusion mode switched to {state}")
-                print("[INFO] Drone mission state reset.")
-
                 if use_microphone:
+                    print("[INFO] Microphone fusion mode ENABLED")
                     start_hydrophone()
+                else:
+                    print("[INFO] Microphone fusion mode DISABLED — stopping mic thread")
+                    if hydrophone_running:
+                        acoustic_drowning.running = False
+                        hydrophone_running = False
+                    mic_drowning = False
             if key == ord('r'):
-                mission_executed = False
+                drone_armed = True
+                print("[INFO] Drone re-armed — ready for next rescue action")
 
 
     finally:
         # Release all resources safely before exit
         drone_keepalive_running = False
+        print("[INFO] Stopping microphone detection thread...")
+        if hydrophone_running:
+            acoustic_drowning.running = False
+            # Give the mic thread time to exit its loop and run stream.close()
+            time.sleep(0.8)
         print("[INFO] Releasing resources and landing drone if needed...")
         try:
             drone.end()
         except Exception:
             pass
         cap.release()
+        # Explicitly destroy named windows (ignore if already destroyed)
+        for win in ["Buoy Intelligent Guard", "Drowning Detection Camera - Drone Linkage"]:
+            try:
+                cv2.destroyWindow(win)
+            except cv2.error:
+                pass
         cv2.destroyAllWindows()
 
 
